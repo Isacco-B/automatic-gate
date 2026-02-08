@@ -5,8 +5,8 @@ const int PIN_PHOTOCELL        = 2;
 const int PIN_RECEIVER         = 3;
 const int PIN_FLASHER          = 4;
 const int PIN_EMERGENCY        = 5;
-const int PIN_MOTOR_SPEED      = 6;
-const int PIN_MOTOR_DIRECTION  = 7;   // HIGH = open, LOW = close
+const int PIN_MOTOR_SPEED      = 9;
+const int PIN_MOTOR_DIRECTION  = 7;
 const int PIN_LIMIT_OPEN       = A0;
 const int PIN_LIMIT_CLOSED     = A1;
 const int PIN_CURRENT_SENSE    = A2;
@@ -18,16 +18,10 @@ const float  OVERCURRENT_SLOW_PHASE   = 7.0f;
 const int    CURRENT_SAMPLES          = 300;
 const int    RECEIVER_DEBOUNCE_MS     = 1500;
 const int    LEARN_MOTOR_SPEED        = 98;
-const float  ADAPT_WEIGHT             = 0.25f; // weight of new measurement in moving average
+const float  ADAPT_WEIGHT             = 0.25f;
 
-// SLOW_PHASE_RATIO defines what fraction of the total travel distance
-// is covered in the slow phase. This is used during learning to split
-// the measured total time into fullTime and slowTime.
-// During normal operation each phase is updated independently via adaptive timing.
 const float  SLOW_PHASE_RATIO         = 0.25f;
-// Speed used when recovering from a mid-travel start (unknown position).
-const int    SAFE_RECOVERY_SPEED      = 92;
-// Minimum speed during the slow phase
+const int    SAFE_RECOVERY_SPEED      = 150;
 const int    SLOW_PHASE_MIN_SPEED     = 85;
 
 // Flasher toggle intervals
@@ -44,26 +38,18 @@ enum GateState {
 
 volatile GateState currentState = STATE_IDLE;
 
-
-// Each direction has two independently tracked times:
-//   fullTime  = time spent at full speed (255)
-//   slowTime  = time spent decelerating to the limit switch
-// Both are updated adaptively after every complete travel.
 unsigned long openTimeFull   = 0;
 unsigned long openTimeSlow   = 0;
 unsigned long closeTimeFull  = 0;
 unsigned long closeTimeSlow  = 0;
 
-// Backup timing: last known-good configuration
-// These are saved periodically when the gate operates correctly,
-// and restored if a travel is detected to be too fast.
 unsigned long openTimeFullBackup   = 0;
 unsigned long openTimeSlowBackup   = 0;
 unsigned long closeTimeFullBackup  = 0;
 unsigned long closeTimeSlowBackup  = 0;
 
 int successfulCycles = 0;
-const int BACKUP_INTERVAL = 5;
+const int BACKUP_INTERVAL = 10;
 
 // Safety threshold: minimum acceptable slow phase duration as a fraction of expected
 const float SLOW_PHASE_MIN_RATIO = 0.3f;
@@ -94,7 +80,7 @@ unsigned long lastReceiverTime = 0;
 
 // I2C
 char i2cCommand  = 0;
-char i2cBuffer[19];
+char i2cBuffer[32];
 
 // LIMIT SWITCH HELPERS
 bool isFullyOpen() {
@@ -163,20 +149,51 @@ void waitForPhotocellClear() {
   }
 }
 
-// Returns the motor speed for a given moment inside the slow phase.
-// elapsed = time since the slow phase started
-// totalSlowTime = total duration of the slow phase
-// Speed ramps linearly from 255 down to SLOW_PHASE_MIN_SPEED.
 int slowPhaseSpeed(unsigned long elapsed, unsigned long totalSlowTime) {
   if (totalSlowTime == 0) return SLOW_PHASE_MIN_SPEED;
-  float ratio = (float)elapsed / (float)totalSlowTime;  // 0.0 at start, 1.0 at end
+  float ratio = (float)elapsed / (float)totalSlowTime;
   if (ratio > 1.0f) ratio = 1.0f;
   int speed = (int)(255.0f - (255.0f - SLOW_PHASE_MIN_SPEED) * ratio);
   return speed;
 }
 
-// Called after a complete travel (limit switch to limit switch).
-// measuredFullMs and measuredSlowMs are the actual durations of each phase.
+// POSITION HELPERS
+unsigned long calcPositionOpening(unsigned long startPos, unsigned long elapsed, unsigned long totalTime) {
+  if (totalTime == 0) return startPos;
+  unsigned long travel = (unsigned long)((float)elapsed * startPos / (float)totalTime);
+  if (travel >= startPos) return 0;
+  return startPos - travel;
+}
+
+unsigned long calcPositionClosing(unsigned long startPos, unsigned long elapsed, unsigned long totalTime) {
+  if (totalTime == 0) return startPos;
+  unsigned long remaining = 100 - startPos;
+  unsigned long travel = (unsigned long)((float)elapsed * remaining / (float)totalTime);
+  unsigned long pos = startPos + travel;
+  if (pos > 100) pos = 100;
+  return pos;
+}
+
+unsigned long calcSafeRecoveryPositionOpening(unsigned long elapsed, unsigned long totalTime) {
+  if (totalTime == 0) return position;
+  unsigned long startPos = position;
+  if (startPos == 0) startPos = 50;
+  unsigned long travel = (unsigned long)((float)elapsed * startPos / (float)totalTime);
+  if (travel >= startPos) return 0;
+  return startPos - travel;
+}
+
+unsigned long calcSafeRecoveryPositionClosing(unsigned long elapsed, unsigned long totalTime) {
+  if (totalTime == 0) return position;
+  unsigned long startPos = position;
+  if (startPos == 100) startPos = 50;
+  unsigned long remaining = 100 - startPos;
+  unsigned long travel = (unsigned long)((float)elapsed * remaining / (float)totalTime);
+  unsigned long pos = startPos + travel;
+  if (pos > 100) pos = 100;
+  return pos;
+}
+
 void updateOpenTiming(unsigned long measuredFullMs, unsigned long measuredSlowMs) {
   openTimeFull = (unsigned long)((1.0f - ADAPT_WEIGHT) * openTimeFull + ADAPT_WEIGHT * measuredFullMs);
   openTimeSlow = (unsigned long)((1.0f - ADAPT_WEIGHT) * openTimeSlow + ADAPT_WEIGHT * measuredSlowMs);
@@ -191,7 +208,6 @@ void updateCloseTiming(unsigned long measuredFullMs, unsigned long measuredSlowM
   Serial.print(" slow: "); Serial.println(closeTimeSlow);
 }
 
-// Saves the current timing as a known-good backup
 void backupTiming() {
   openTimeFullBackup  = openTimeFull;
   openTimeSlowBackup  = openTimeSlow;
@@ -200,7 +216,6 @@ void backupTiming() {
   Serial.println("Timing backup saved");
 }
 
-// Restores timing from the last known-good backup
 void restoreTiming() {
   if (openTimeFullBackup > 0 && closeTimeFullBackup > 0) {
     openTimeFull  = openTimeFullBackup;
@@ -213,10 +228,8 @@ void restoreTiming() {
   }
 }
 
-// Validates that the slow phase duration was acceptable
-// Returns true if safe, false if the gate arrived too fast
 bool validateSlowPhase(unsigned long expectedSlowMs, unsigned long actualSlowMs, const char* direction) {
-  if (expectedSlowMs == 0) return true; // can't validate without expected time
+  if (expectedSlowMs == 0) return true;
 
   float ratio = (float)actualSlowMs / (float)expectedSlowMs;
 
@@ -240,7 +253,6 @@ bool validateSlowPhase(unsigned long expectedSlowMs, unsigned long actualSlowMs,
   return true;
 }
 
-// Simple linear interpolation based on elapsed time vs total expected time.
 unsigned long estimatePosition(unsigned long elapsed, unsigned long totalTime, bool opening) {
   if (totalTime == 0) return 50;
   unsigned long pct = elapsed * 100 / totalTime;
@@ -248,7 +260,6 @@ unsigned long estimatePosition(unsigned long elapsed, unsigned long totalTime, b
   return opening ? (100 - pct) : pct;
 }
 
-// STATE TRANSITION LOGIC
 void checkStateTransition() {
   if (!learned) {
     currentState = STATE_LEARNING;
@@ -293,13 +304,26 @@ void doOpening() {
 
     if (!useIntelligentRecovery) {
       Serial.println("Opening: safe recovery");
+
+      unsigned long safeStartPos = (positionValid && lastKnownPosition <= 100) ? lastKnownPosition : 50;
+      position = safeStartPos;
+
+      unsigned long totalOpenTime = openTimeFull + openTimeSlow;
+      unsigned long safeRecoveryEstimate = (totalOpenTime > 0) ?
+        (unsigned long)((float)totalOpenTime * safeStartPos / 100.0f * 255.0f / SAFE_RECOVERY_SPEED) : 0;
+
       motorOpen(SAFE_RECOVERY_SPEED);
       unsigned long startMillis = millis();
 
       while (!isFullyOpen()) {
         delay(100);
         sampleCurrent();
-        position = 50;
+
+        if (safeRecoveryEstimate > 0) {
+          unsigned long elapsed = millis() - startMillis;
+          unsigned long travel = (unsigned long)((float)elapsed * safeStartPos / (float)safeRecoveryEstimate);
+          position = (travel >= safeStartPos) ? 0 : (safeStartPos - travel);
+        }
 
         if (overCurrentFlag || currentState == STATE_IDLE || isEmergencyPressed()) {
           motorStop();
@@ -309,7 +333,7 @@ void doOpening() {
           currentState = STATE_IDLE;
           returnFlag = false;
           lastKnownPosition = position;
-          positionValid = false;
+          positionValid = (position > 0 && position < 100);
           return;
         }
 
@@ -327,16 +351,24 @@ void doOpening() {
     Serial.print("Opening: fast recovery, time limit: ");
     Serial.println(estimatedTimeRemaining);
 
+    unsigned long recoveryStartPos = lastKnownPosition;
+    position = recoveryStartPos;
+
     learnStartMillis = millis();
     unsigned long travelStart = millis();
     motorOpen(255);
     unsigned long fullPhaseEnd = 0;
 
+    unsigned long totalRecoveryTime = estimatedTimeRemaining + openTimeSlow;
+
     while (!isFullyOpen()) {
       delay(100);
       unsigned long elapsed = millis() - travelStart;
-      position = lastKnownPosition - (elapsed * 100 / (openTimeFull + openTimeSlow));
-      if (position > 100) position = 0;
+
+      if (totalRecoveryTime > 0) {
+        unsigned long travel = (unsigned long)((float)elapsed * recoveryStartPos / (float)totalRecoveryTime);
+        position = (travel >= recoveryStartPos) ? 0 : (recoveryStartPos - travel);
+      }
 
       sampleCurrent();
 
@@ -378,6 +410,7 @@ void doOpening() {
   }
 
   Serial.println("Opening: full travel");
+  position = 100;
   learnStartMillis = millis();
   unsigned long travelStart = millis();
 
@@ -393,7 +426,6 @@ void doOpening() {
 
     sampleCurrent();
 
-    // Check if it's time to enter slow phase
     if (elapsed >= openTimeFull && fullPhaseEnd == 0) {
       fullPhaseEnd = millis();
       Serial.println("Opening: entering slow phase");
@@ -406,7 +438,6 @@ void doOpening() {
       overCurrentThreshold = OVERCURRENT_SLOW_PHASE;
     }
 
-    // Safety checks
     if (overCurrentFlag || currentState == STATE_IDLE || isEmergencyPressed()) {
       motorStop();
       flasherOff();
@@ -427,7 +458,6 @@ void doOpening() {
 
   position = 0;
 
-  // Adaptive update: only if we started from a known position
   if (learnStartMillis > 0 && fullPhaseEnd > 0) {
     unsigned long measuredFull = fullPhaseEnd - learnStartMillis;
     unsigned long measuredSlow = millis() - fullPhaseEnd;
@@ -485,6 +515,14 @@ void doClosing() {
     if (!useIntelligentRecovery) {
       Serial.println("Closing: safe recovery");
 
+      unsigned long safeStartPos = (positionValid && lastKnownPosition <= 100) ? lastKnownPosition : 50;
+      position = safeStartPos;
+
+      unsigned long totalCloseTime = closeTimeFull + closeTimeSlow;
+      unsigned long remaining = 100 - safeStartPos;
+      unsigned long safeRecoveryEstimate = (totalCloseTime > 0 && remaining > 0) ?
+        (unsigned long)((float)totalCloseTime * remaining / 100.0f * 255.0f / SAFE_RECOVERY_SPEED) : 0;
+
       waitForPhotocellClear();
 
       motorClose(SAFE_RECOVERY_SPEED);
@@ -493,7 +531,13 @@ void doClosing() {
       while (!isFullyClosed()) {
         delay(100);
         sampleCurrent();
-        position = 50;
+
+        if (safeRecoveryEstimate > 0) {
+          unsigned long elapsed = millis() - startMillis;
+          unsigned long travel = (unsigned long)((float)elapsed * remaining / (float)safeRecoveryEstimate);
+          position = safeStartPos + travel;
+          if (position > 100) position = 100;
+        }
 
         if (isPhotocellBlocked() || overCurrentFlag || currentState == STATE_OPENING || isEmergencyPressed()) {
           motorStop();
@@ -504,7 +548,7 @@ void doClosing() {
           currentState = STATE_OPENING;
           flasherOff();
           lastKnownPosition = position;
-          positionValid = false;
+          positionValid = (position > 0 && position < 100);
           return;
         }
 
@@ -524,16 +568,26 @@ void doClosing() {
     Serial.print("Closing: fast recovery, time limit: ");
     Serial.println(estimatedTimeRemaining);
 
+    unsigned long recoveryStartPos = lastKnownPosition;
+    position = recoveryStartPos;
+
     learnStartMillis = millis();
     unsigned long travelStart = millis();
     motorClose(255);
     unsigned long fullPhaseEnd = 0;
 
+    unsigned long totalRecoveryTime = estimatedTimeRemaining + closeTimeSlow;
+    unsigned long remainingTravel = 100 - recoveryStartPos;
+
     while (!isFullyClosed()) {
       delay(100);
       unsigned long elapsed = millis() - travelStart;
-      position = lastKnownPosition + (elapsed * 100 / (closeTimeFull + closeTimeSlow));
-      if (position > 100) position = 100;
+
+      if (totalRecoveryTime > 0 && remainingTravel > 0) {
+        unsigned long travel = (unsigned long)((float)elapsed * remainingTravel / (float)totalRecoveryTime);
+        position = recoveryStartPos + travel;
+        if (position > 100) position = 100;
+      }
 
       sampleCurrent();
 
@@ -578,6 +632,7 @@ void doClosing() {
   }
 
   Serial.println("Closing: full travel");
+  position = 0;
   learnStartMillis = millis();
   unsigned long travelStart = millis();
 
@@ -598,7 +653,6 @@ void doClosing() {
       Serial.println("Closing: entering slow phase");
     }
 
-    // Phase 2: slow phase — ramp speed down over closeTimeSlow
     if (fullPhaseEnd > 0) {
       unsigned long slowElapsed = millis() - fullPhaseEnd;
       int speed = slowPhaseSpeed(slowElapsed, closeTimeSlow);
@@ -606,7 +660,6 @@ void doClosing() {
       overCurrentThreshold = OVERCURRENT_SLOW_PHASE;
     }
 
-    // Safety checks
     if (isPhotocellBlocked() || overCurrentFlag || currentState == STATE_OPENING || isEmergencyPressed()) {
       motorStop();
       delay(2000);
@@ -628,7 +681,6 @@ void doClosing() {
 
   position = 100;
 
-  // Adaptive update: only if we started from a known position
   if (learnStartMillis > 0 && fullPhaseEnd > 0) {
     unsigned long measuredFull = fullPhaseEnd - learnStartMillis;
     unsigned long measuredSlow = millis() - fullPhaseEnd;
@@ -666,8 +718,6 @@ void doLearning() {
   flasherOff();
   motorStop();
 
-  // Speed correction factor: learning measures at LEARN_MOTOR_SPEED, but real travel
-  // uses 255 for the full-speed phase. We need to scale the measured times.
   const float speedFactor = (float)LEARN_MOTOR_SPEED / 255.0f;
 
   bool startFromClosed = false;
@@ -675,9 +725,11 @@ void doLearning() {
 
   if (isFullyClosed()) {
     Serial.println("Learning: starting from closed position");
+    position = 100;
     startFromClosed = true;
   } else if (isFullyOpen()) {
     Serial.println("Learning: starting from open position");
+    position = 0;
     startFromOpen = true;
   } else {
     Serial.println("Learning: mid-travel detected, recovering to closed");
@@ -713,7 +765,6 @@ void doLearning() {
     startFromClosed = true;
   }
 
-  // ── Measurement sequence based on starting position ──
   if (startFromClosed) {
 
     Serial.println("Learning: measuring open time");
@@ -739,7 +790,6 @@ void doLearning() {
 
       unsigned long totalOpenMs = millis() - startMillis;
 
-      // Apply speed correction and split into phases
       openTimeSlow = (unsigned long)(totalOpenMs * SLOW_PHASE_RATIO);
       openTimeFull = (unsigned long)((totalOpenMs - openTimeSlow) * speedFactor);
 
@@ -781,7 +831,6 @@ void doLearning() {
 
       unsigned long totalCloseMs = millis() - startMillis;
 
-      // Apply speed correction and split into phases
       closeTimeSlow = (unsigned long)(totalCloseMs * SLOW_PHASE_RATIO);
       closeTimeFull = (unsigned long)((totalCloseMs - closeTimeSlow) * speedFactor);
 
@@ -793,7 +842,6 @@ void doLearning() {
 
     Serial.println("Learning: measuring close time");
 
-    // Wait for photocell before closing
     while (isPhotocellBlocked()) {
       delay(100);
       if (digitalRead(PIN_RECEIVER)) {
@@ -824,7 +872,6 @@ void doLearning() {
 
       unsigned long totalCloseMs = millis() - startMillis;
 
-      // Apply speed correction and split into phases
       closeTimeSlow = (unsigned long)(totalCloseMs * SLOW_PHASE_RATIO);
       closeTimeFull = (unsigned long)((totalCloseMs - closeTimeSlow) * speedFactor);
 
@@ -834,7 +881,6 @@ void doLearning() {
 
     delay(3000);
 
-    // 2. Measure open (closed -> open)
     Serial.println("Learning: measuring open time");
     {
       unsigned long startMillis = millis();
@@ -858,7 +904,6 @@ void doLearning() {
 
       unsigned long totalOpenMs = millis() - startMillis;
 
-      // Apply speed correction and split into phases
       openTimeSlow = (unsigned long)(totalOpenMs * SLOW_PHASE_RATIO);
       openTimeFull = (unsigned long)((totalOpenMs - openTimeSlow) * speedFactor);
 
@@ -867,12 +912,10 @@ void doLearning() {
     }
   }
 
-  // ── Both directions measured successfully ──
   if (openTimeFull > 0 && closeTimeFull > 0) {
     learned = true;
     currentState = STATE_IDLE;
 
-    // Create initial backup immediately after learning
     backupTiming();
     successfulCycles = 0;
 
@@ -893,7 +936,9 @@ void onReceiverSignal() {
 
 
 // I2C CALLBACKS
-void onI2CReceive() {
+void onI2CReceive(int howMany) {
+  if (howMany <= 0) return;
+
   i2cCommand = Wire.read();
 }
 
@@ -928,7 +973,7 @@ void onI2CRequest() {
     else if (currentState == STATE_OPENING)                      status = 3; // opening
     else if (currentState == STATE_CLOSING)                      status = 4; // closing
 
-    char curBuf[4];
+    char curBuf[8];
     dtostrf(currentValue, 4, 2, curBuf);
     sprintf(i2cBuffer, "%d,%03lu,%d,%d,%d,%d,%s,%d", status, position, fap, fch, foto, coste, curBuf, ric);
 
@@ -945,6 +990,10 @@ void setup() {
   pinMode(PIN_FLASHER,          OUTPUT);
   pinMode(PIN_EMERGENCY,        INPUT_PULLUP);
   pinMode(PIN_MOTOR_SPEED,      OUTPUT);
+
+  // 122 Hz
+  TCCR1B = TCCR1B & 0b11111000 | 0x04;
+
   pinMode(PIN_MOTOR_DIRECTION,  OUTPUT);
 
   attachInterrupt(digitalPinToInterrupt(PIN_RECEIVER), onReceiverSignal, RISING);
@@ -966,8 +1015,9 @@ void loop() {
 
     case STATE_IDLE:
       sampleCurrent();
-      if (isFullyOpen())   position = 0;
-      if (isFullyClosed()) position = 100;
+      // Only force position at endstops; otherwise keep last known position
+      if (isFullyOpen())        position = 0;
+      else if (isFullyClosed()) position = 100;
       flasherOff();
       motorStop();
       break;
@@ -977,9 +1027,6 @@ void loop() {
       break;
 
     case STATE_OPENING: {
-      // Opening includes an auto-close cycle:
-      //   open -> wait 60s -> close
-      // If the close is interrupted (obstacle/emergency), the cycle repeats.
       do {
         returnFlag = false;
         doOpening();
