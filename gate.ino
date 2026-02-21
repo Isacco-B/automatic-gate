@@ -31,12 +31,12 @@ const int   MAX_DIRECTION_CHANGES   = 5;
 const int   BACKUP_INTERVAL         = 10;
 
 const unsigned long OPEN_WAIT_MS                     = 60000;
-const unsigned long WALK_THROUGH_OPEN_PCT            = 80;
+const unsigned long WALK_THROUGH_OPEN_PCT            = 25;
 const unsigned long FLASHER_TOGGLE_INTERVAL          = 500;
 const unsigned long FLASHER_TOGGLE_INTERVAL_LEARNING = 200;
 
 const unsigned long RECOVERY_INTELLIGENT_OPEN_THRESHOLD  = 70;
-const unsigned long RECOVERY_INTELLIGENT_CLOSE_THRESHOLD = 40;
+const unsigned long RECOVERY_INTELLIGENT_CLOSE_THRESHOLD = 30;
 
 const bool OVERCURRENT_ENABLED = false;
 
