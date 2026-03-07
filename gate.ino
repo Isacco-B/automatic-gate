@@ -27,6 +27,7 @@ const float SLOW_PHASE_RATIO        = 0.25f;
 const int   SAFE_RECOVERY_SPEED     = 150;
 const int   SLOW_PHASE_MIN_SPEED    = 85;
 const float SLOW_PHASE_MIN_RATIO    = 0.3f;
+const float SLOW_PHASE_MAX_RATIO    = 2.5f;
 const int   MAX_DIRECTION_CHANGES   = 5;
 const int   BACKUP_INTERVAL         = 10;
 
@@ -179,8 +180,8 @@ void updateCloseTiming(unsigned long measuredFull, unsigned long measuredSlow) {
   Serial.print("  slow: "); Serial.println(closeTimeSlow);
 }
 
-bool validateSlowPhase(unsigned long expectedMs, unsigned long actualMs, const char* dir) {
-  if (expectedMs == 0) return true;
+int validateSlowPhase(unsigned long expectedMs, unsigned long actualMs, const char* dir) {
+  if (expectedMs == 0) return 0;
   float ratio = (float)actualMs / (float)expectedMs;
   Serial.println(expectedMs); Serial.println(ratio);
   if (ratio < SLOW_PHASE_MIN_RATIO) {
@@ -188,9 +189,16 @@ bool validateSlowPhase(unsigned long expectedMs, unsigned long actualMs, const c
     Serial.print(" slow phase too short! Expected: "); Serial.print(expectedMs);
     Serial.print("ms, Actual: "); Serial.print(actualMs);
     Serial.print("ms ("); Serial.print(ratio * 100.0f); Serial.println("%)");
-    return false;
+    return -1;
   }
-  return true;
+  if (ratio > SLOW_PHASE_MAX_RATIO) {
+    Serial.print("WARNING: "); Serial.print(dir);
+    Serial.print(" slow phase too long! Expected: "); Serial.print(expectedMs);
+    Serial.print("ms, Actual: "); Serial.print(actualMs);
+    Serial.print("ms ("); Serial.print(ratio * 100.0f); Serial.println("%)");
+    return 1;
+  }
+  return 0;
 }
 
 void tryAdaptTiming(unsigned long travelStart, unsigned long fullPhaseEnd,
@@ -201,16 +209,31 @@ void tryAdaptTiming(unsigned long travelStart, unsigned long fullPhaseEnd,
 
   unsigned long measuredFull = fullPhaseEnd - travelStart;
   unsigned long measuredSlow = millis() - fullPhaseEnd;
-  bool valid = validateSlowPhase(expectedSlow, measuredSlow, dir);
+  int validation = validateSlowPhase(expectedSlow, measuredSlow, dir);
 
-  if (valid && !prevCycleWasComplete) {
-    updateFn(measuredFull, measuredSlow);
+  if (validation == -1) {
+    restoreTiming();
+    successfulCycles = 0;
+    return;
+  }
+
+  unsigned long adaptedSlow = (unsigned long)((1.0f - ADAPT_WEIGHT) * expectedSlow + ADAPT_WEIGHT * measuredSlow);
+  unsigned long correctedFull;
+  if (measuredSlow >= adaptedSlow) {
+    correctedFull = measuredFull + (measuredSlow - adaptedSlow);
+  } else {
+    unsigned long deficit = adaptedSlow - measuredSlow;
+    correctedFull = (measuredFull > deficit) ? (measuredFull - deficit) : 0;
+  }
+
+  if (validation == 0 && !prevCycleWasComplete) {
+    updateFn(correctedFull, measuredSlow);
     if (++successfulCycles >= BACKUP_INTERVAL) {
       backupTiming();
       successfulCycles = 0;
     }
-  } else if (!valid) {
-    restoreTiming();
+  } else if (validation == 1) {
+    updateFn(correctedFull, measuredSlow);
     successfulCycles = 0;
   }
 }
